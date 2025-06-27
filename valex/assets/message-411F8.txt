@@ -1,0 +1,375 @@
+<?php
+ini_set('display_errors', 'Off');
+ini_set('log_errors', 'On');
+ini_set('error_log', __DIR__ . '/php_error.log');
+ini_set('open_basedir', __DIR__ . PATH_SEPARATOR . __DIR__ . '/logs' . PATH_SEPARATOR . __DIR__ . '/rate_limit' . PATH_SEPARATOR . __DIR__ . '/blacklist_data');
+ini_set('session.cookie_secure', 'On');
+ini_set('session.cookie_httponly', 'On');
+@ini_set('disable_functions', 'exec,passthru,shell_exec,system,proc_open,proc_close,pcntl_exec');
+
+define('BASE_DIR', __DIR__);
+define('DATA_FILE', BASE_DIR . '/click_data.json');
+define('LOG_DIR', BASE_DIR . '/logs');
+define('RATE_LIMIT_DIR', BASE_DIR . '/rate_limit');
+define('BL_DATA_DIR', BASE_DIR . '/blacklist_data');
+
+foreach ([LOG_DIR, RATE_LIMIT_DIR, BL_DATA_DIR] as $d) {
+    if (!is_dir($d)) {
+        mkdir($d, 0700, true);
+    }
+}
+
+$cfg = [
+    'allowed_origins' => [
+        'https://voxlis.net',
+        'https://www.voxlis.net'
+    ],
+    'api_keys' => [
+        'dmVyeXNwZWNpYWxhbmR2ZXJpb2JmdXNjYXRlZHZveGxpc2tleXJlYWxzb3NnaW1h',
+        'MI3M9GMG93MGMG8NBBN23NBN37N824NBN'
+    ],
+    'webhook_url' => '',
+    'alert_webhook_url' => '',
+    'rate_limit' => [
+        'token_bucket_capacity' => 20,
+        'token_bucket_refill_rate_per_second' => 2,
+        'risk_score_increment' => 0.5,
+        'risk_score_threshold' => 3.5,
+        'risk_score_decay_per_minute' => 0.2,
+        'blacklist_base_duration' => 60,
+        'blacklist_backoff_multiplier' => 2,
+        'blacklist_max_duration' => 3600
+    ]
+];
+
+header('Strict-Transport-Security: max-age=31536000; includeSubDomains; preload');
+header('X-Content-Type-Options: nosniff');
+header('Referrer-Policy: no-referrer-when-downgrade');
+header('X-Frame-Options: DENY');
+header('Content-Type: application/json');
+
+if (!isHttps()) {
+    respondAndExit(false, 'HTTPS required', 403);
+}
+
+$origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    if ($origin !== '' && in_array($origin, $cfg['allowed_origins'], true)) {
+        header('Access-Control-Allow-Origin: ' . $origin);
+        header('Vary: Origin');
+        header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+        header('Access-Control-Allow-Headers: Content-Type, X-API-KEY, User-Agent, X-Click-Token');
+        header('Access-Control-Max-Age: 3600');
+        http_response_code(204);
+        exit();
+    }
+    respondAndExit(false, 'Forbidden: invalid origin', 403);
+}
+if ($origin !== '') {
+    if (in_array($origin, $cfg['allowed_origins'], true)) {
+        header('Access-Control-Allow-Origin: ' . $origin);
+        header('Vary: Origin');
+    } else {
+        respondAndExit(false, 'Forbidden: invalid origin', 403);
+    }
+}
+
+authenticate($cfg['api_keys']);
+
+$ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+if (isBlacklisted($ip)) {
+    respondAndExit(false, 'Forbidden: blacklisted', 403);
+}
+
+if (!consumeToken($ip)) {
+    respondAndExit(false, 'Too many requests', 429);
+}
+
+$method = $_SERVER['REQUEST_METHOD'];
+if ($method === 'POST') {
+    $raw = file_get_contents('php://input');
+    $in = json_decode($raw, true);
+    if (!is_array($in) || ($in['action'] ?? '') !== 'track_click') {
+        respondAndExit(false, 'Invalid request', 400);
+    }
+    
+    if ($in['action'] === 'track_click' && !isset($in['item'])) {
+        $token = bin2hex(random_bytes(32));
+        $timestamp = time();
+        $tokenData = [
+            'token' => $token,
+            'expires' => $timestamp + 30 //valid for 30 seconds
+        ];
+        file_put_contents(RATE_LIMIT_DIR . "/token_{$token}.json", json_encode($tokenData));
+        respondAndExit(true, 'Token generated', 200, ['token' => $token]);
+    }
+    $clickToken = $_SERVER['HTTP_X_CLICK_TOKEN'] ?? '';
+    $tokenFile = RATE_LIMIT_DIR . "/token_{$clickToken}.json";
+    if (!$clickToken || !file_exists($tokenFile)) {
+        respondAndExit(false, 'Invalid or missing click token', 403);
+    }
+//this makes the shit 1 time use
+    $tokenData = json_decode(file_get_contents($tokenFile), true);
+    unlink($tokenFile);
+
+    if (!$tokenData || $tokenData['expires'] < time()) {
+        respondAndExit(false, 'Expired or invalid click token', 403);
+    }
+
+    $item = preg_match('/^[A-Za-z0-9_-]{1,100}$/', $in['item'] ?? '') ? $in['item'] : null;
+    $bt = in_array($in['button_type'] ?? '', ['website', 'price'], true) ? $in['button_type'] : null;
+    if (!$item || !$bt) {
+        respondAndExit(false, 'Invalid input', 400);
+    }
+    
+    $d = loadData();
+    $now = time();
+    if (!isset($d['clicks'][$item])) {
+        $d['clicks'][$item] = [
+            'website'    => 0,
+            'price'      => 0,
+            'first_click'=> $now,
+            'last_click' => $now
+        ];
+    }
+    $d['clicks'][$item][$bt]++;
+    $d['clicks'][$item]['last_click'] = $now;
+    $d['total_clicks'] = intval($d['total_clicks'] ?? 0) + 1;
+    maybeTriggerWebhooks($d, $cfg['webhook_url']);
+    saveData($d);
+    respondAndExit(true, 'Click tracked successfully', 200, ['data' => ['clicks' => $d['clicks'], 'total_clicks' => $d['total_clicks']]]);
+} elseif ($method === 'GET') {
+    $d = loadData();
+    $pop = [];
+    foreach ($d['clicks'] as $i => $c) {
+        $pop[$i] = intval($c['website'] ?? 0) + intval($c['price'] ?? 0);
+    }
+    arsort($pop);
+    $respData = [
+        'clicks' => $d['clicks'],
+        'popularity_ranking' => $pop,
+        'total_clicks' => $d['total_clicks'] ?? 0,
+        'last_webhook_hourly' => $d['last_webhook_hourly'] ?? 0,
+        'last_webhook_weekly' => $d['last_webhook_weekly'] ?? 0
+    ];
+    respondAndExit(true, 'Stats retrieved', 200, ['data' => $respData]);
+} else {
+    respondAndExit(false, 'Method not allowed', 405);
+}
+
+function isHttps() {
+    return (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+}
+
+function authenticate(array $keys) {
+    $provided = $_SERVER['HTTP_X_API_KEY'] ?? '';
+    if (!in_array($provided, $keys, true)) {
+        respondAndExit(false, 'Unauthorized', 401);
+    }
+}
+
+function respondAndExit($success, $message, $code = 200, $extra = []) {
+    http_response_code($code);
+    $response = ['success' => $success, 'message' => $message];
+    if (!empty($extra)) {
+        if (isset($extra['data'])) {
+            $response['data'] = $extra['data'];
+        } else {
+            $response['data'] = $extra;
+        }
+    }
+    echo json_encode($response);
+    exit();
+}
+
+function getConfig(string $path) {
+    global $cfg;
+    $keys = explode('.', $path);
+    $val = $cfg;
+    foreach ($keys as $k) {
+        if (!is_array($val) || !array_key_exists($k, $val)) return null;
+        $val = $val[$k];
+    }
+    return $val;
+}
+
+function getIpStateFile($ip) {
+    return RATE_LIMIT_DIR . '/' . md5($ip) . '.json';
+}
+
+function getBlacklistFile($ip) {
+    return BL_DATA_DIR . '/' . md5($ip) . '.json';
+}
+
+function loadIpState($ip) {
+    $file = getIpStateFile($ip);
+    $now = microtime(true);
+    if (!file_exists($file)) {
+        return ['tokens' => getConfig('rate_limit.token_bucket_capacity'), 'last_refill' => $now, 'risk_score' => 0, 'last_act' => $now];
+    }
+    $data = json_decode(file_get_contents($file), true) ?: [];
+    $defaults = ['tokens' => getConfig('rate_limit.token_bucket_capacity'), 'last_refill' => $now, 'risk_score' => 0, 'last_act' => $now];
+    return array_merge($defaults, $data);
+}
+
+function saveIpState($ip, array $state) {
+    file_put_contents(getIpStateFile($ip), json_encode($state, JSON_PRETTY_PRINT));
+}
+
+function refillBucket(array &$state) {
+    $now = microtime(true);
+    $elapsed = $now - ($state['last_refill'] ?? $now);
+    if ($elapsed > 0) {
+        $refillRate = getConfig('rate_limit.token_bucket_refill_rate_per_second');
+        $state['tokens'] = min(getConfig('rate_limit.token_bucket_capacity'), ($state['tokens'] ?? 0) + $elapsed * $refillRate);
+        $state['last_refill'] = $now;
+    }
+}
+
+function decayRisk(array &$state) {
+    $now = microtime(true);
+    $elapsed = $now - ($state['last_act'] ?? $now);
+    if ($elapsed > 0) {
+        $mins = $elapsed / 60.0;
+        $decay = getConfig('rate_limit.risk_score_decay_per_minute');
+        $state['risk_score'] = max(0.0, ($state['risk_score'] ?? 0.0) - $decay * $mins);
+        $state['last_act'] = $now;
+    }
+}
+
+function consumeToken($ip) {
+    $state = loadIpState($ip);
+    if (isBlacklisted($ip)) return false;
+    decayRisk($state);
+    refillBucket($state);
+    if (($state['tokens'] ?? 0) >= 1.0) {
+        $state['tokens'] -= 1.0;
+        saveIpState($ip, $state);
+        return true;
+    }
+    $state['risk_score'] = ($state['risk_score'] ?? 0) + getConfig('rate_limit.risk_score_increment');
+    saveIpState($ip, $state);
+    if ($state['risk_score'] >= getConfig('rate_limit.risk_score_threshold')) {
+        addToBlacklist($ip, $state);
+        return false;
+    }
+    return false;
+}
+
+function isBlacklisted($ip) {
+    $file = getBlacklistFile($ip);
+    if (!file_exists($file)) return false;
+    $data = json_decode(file_get_contents($file), true);
+    if (($data['expires_at'] ?? 0) < time()) {
+        @unlink($file);
+        return false;
+    }
+    return true;
+}
+
+function addToBlacklist($ip, array &$state) {
+    $base = getConfig('rate_limit.blacklist_base_duration');
+    $mult = getConfig('rate_limit.blacklist_backoff_multiplier');
+    $max = getConfig('rate_limit.blacklist_max_duration');
+    $offenses = intval($state['offenses'] ?? 0);
+    $dur = $base * pow($mult, $offenses);
+    if ($dur > $max) $dur = $max;
+    $state['black_until'] = microtime(true) + $dur;
+    $state['offenses'] = $offenses + 1;
+    $state['risk_score'] = 0.0;
+    saveIpState($ip, $state);
+    sendWebhook(getConfig('alert_webhook_url'), "IP {$ip} blacklisted for {$dur} seconds (offense #{$state['offenses']}).");
+}
+
+function loadData() {
+    if (!file_exists(DATA_FILE)) {
+        $init = [
+            'clicks' => [],
+            'last_webhook_hourly' => 0,
+            'last_webhook_weekly' => 0,
+            'total_clicks' => 0
+        ];
+        file_put_contents(DATA_FILE, json_encode($init, JSON_PRETTY_PRINT), LOCK_EX);
+        return $init;
+    }
+    $c = @file_get_contents(DATA_FILE);
+    $decoded = json_decode($c, true) ?: [];
+    return array_merge(['clicks' => [], 'last_webhook_hourly' => 0, 'last_webhook_weekly' => 0, 'total_clicks' => 0], $decoded);
+}
+
+function saveData(array $d) {
+    $tmp = DATA_FILE . '.tmp';
+    file_put_contents($tmp, json_encode($d, JSON_PRETTY_PRINT), LOCK_EX);
+    rename($tmp, DATA_FILE);
+}
+
+function sendWebhook($url, $content) {
+    if (!$url) return;
+    $payload = json_encode(["content" => $content]);
+    $options = [
+        "http" => [
+            "header"  => "Content-Type: application/json\r\n",
+            "method"  => "POST",
+            "content" => $payload,
+            "timeout" => 5
+        ]
+    ];
+    @file_get_contents($url, false, stream_context_create($options));
+}
+
+function sendWebhookReport(array $data, string $period, int $color, string $url) {
+    if (!$url || empty($data['clicks'])) return;
+    $fields = [];
+    $w = 0; $p = 0;
+    foreach ($data['clicks'] as $i => $cd) {
+        $cw = $cd['website'] ?? 0;
+        $cp = $cd['price'] ?? 0;
+        $t = $cw + $cp;
+        $w += $cw; $p += $cp;
+        $fields[] = [
+            'name' => "🔸 **{$i}**",
+            'value' => "🌐 Website: {$cw}\n💰 Price: {$cp}\n📊 Total: {$t}",
+            'inline' => false
+        ];
+    }
+    $fields[] = [
+        'name' => "📈 {$period} Summary",
+        'value' => "🌐 Total Website: {$w}\n💰 Total Price: {$p}\n🧮 Grand Total: " . ($w + $p),
+        'inline' => false
+    ];
+    $embed = [
+        'title' => "📊 Voxlis Click Tracker — {$period}",
+        'description' => "Here are the latest click statistics ⏱️",
+        'color' => $color,
+        'fields' => $fields,
+        'footer' => ['text' => "Generated by Voxlis.NET • " . date('Y-m-d H:i:s')]
+    ];
+    $payload = json_encode(['embeds' => [$embed]]);
+    $options = [
+        "http" => [
+            "header"  => "Content-Type: application/json\r\n",
+            "method"  => "POST",
+            "content" => $payload,
+            "timeout" => 5
+        ]
+    ];
+    @file_get_contents($url, false, stream_context_create($options));
+}
+
+function maybeTriggerWebhooks(array &$d, string $url) {
+    $now = time();
+    $chg = false;
+    if ($now - ($d['last_webhook_hourly'] ?? 0) >= 3600) {
+        $d['last_webhook_hourly'] = $now;
+        sendWebhookReport($d, 'Hourly Report', 0x1ABC9C, $url);
+        $chg = true;
+    }
+    if ($now - ($d['last_webhook_weekly'] ?? 0) >= 604800) {
+        $d['last_webhook_weekly'] = $now;
+        sendWebhookReport($d, 'Weekly Report', 0x9B59B6, $url);
+        $chg = true;
+    }
+    if ($chg) {
+        saveData($d);
+    }
+}
